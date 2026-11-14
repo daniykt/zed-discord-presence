@@ -42,7 +42,10 @@ pub struct PresenceService {
 
 impl PresenceService {
     pub fn new(state: Arc<AppState>, config: PresenceConfig) -> Self {
-        let idle_manager = Arc::new(IdleManager::new(Arc::clone(&state.shutting_down)));
+        let idle_manager = Arc::new(IdleManager::new(
+            Arc::clone(&state.shutting_down),
+            Arc::clone(&state.owner),
+        ));
 
         Self {
             state,
@@ -142,6 +145,11 @@ impl PresenceService {
             return Ok(());
         }
 
+        if !state.owner.is_owner() {
+            debug!("Another instance owns the presence, skipping Discord activity update");
+            return Ok(());
+        }
+
         // Build and set activity
         let activity_fields = Self::build_activity_fields_internal(state, doc.as_ref()).await?;
         let git_url = Self::get_git_url_if_enabled_internal(state).await?;
@@ -224,12 +232,18 @@ impl PresenceService {
         let mut discord = self.state.discord.lock().await;
         let mut first_error = None;
 
-        if let Err(error) = discord.clear_activity().await {
-            warn!(
-                "Failed to clear Discord activity during shutdown: {}",
-                error
-            );
-            first_error = Some(error);
+        // Clearing from a background instance could wipe the presence the
+        // owning instance just set, so only the owner clears on shutdown.
+        if self.state.owner.is_owner() {
+            if let Err(error) = discord.clear_activity().await {
+                warn!(
+                    "Failed to clear Discord activity during shutdown: {}",
+                    error
+                );
+                first_error = Some(error);
+            }
+        } else {
+            debug!("Another instance owns the presence, not clearing it on shutdown");
         }
 
         if let Err(error) = discord.kill().await {

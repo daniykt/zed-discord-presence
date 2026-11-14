@@ -80,6 +80,9 @@ impl Backend {
 
     async fn on_change(&self, uri: &tower_lsp::lsp_types::Url, line_number: Option<u32>) {
         debug!("Document changed");
+        // Only reached from user-driven events (open, change, save, cursor
+        // highlight), never from the polling loop, so it is safe to claim here.
+        self.app_state.owner.claim();
 
         let doc = {
             let workspace = self.app_state.workspace.lock().await;
@@ -355,8 +358,9 @@ async fn main() {
     logger::init_logger();
 
     info!(
-        "Starting Discord Presence LSP server v{}",
-        env!("CARGO_PKG_VERSION")
+        "Starting Discord Presence LSP server v{} (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
     );
 
     let stdin = tokio::io::stdin();

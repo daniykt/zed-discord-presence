@@ -31,19 +31,22 @@ use crate::{
     config::{Configuration, IdleAction},
     discord::Discord,
     document::Document,
+    service::PresenceOwner,
 };
 
 #[derive(Debug)]
 pub struct IdleManager {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     shutting_down: Arc<AtomicBool>,
+    owner: Arc<PresenceOwner>,
 }
 
 impl IdleManager {
-    pub fn new(shutting_down: Arc<AtomicBool>) -> Self {
+    pub fn new(shutting_down: Arc<AtomicBool>, owner: Arc<PresenceOwner>) -> Self {
         Self {
             handle: Arc::new(Mutex::new(None)),
             shutting_down,
+            owner,
         }
     }
 
@@ -84,6 +87,7 @@ impl IdleManager {
         };
 
         let shutting_down = Arc::clone(&self.shutting_down);
+        let owner = Arc::clone(&self.owner);
 
         // Spawn new timeout task
         let handle = tokio::spawn(async move {
@@ -91,6 +95,11 @@ impl IdleManager {
 
             if shutting_down.load(Ordering::SeqCst) {
                 debug!("Idle timeout fired during shutdown, skipping idle action");
+                return;
+            }
+
+            if !owner.is_owner() {
+                debug!("Another instance owns the presence, skipping idle action");
                 return;
             }
 
@@ -152,7 +161,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_timeout_clears_handle() {
         let state = Arc::new(AppState::new());
-        let idle_manager = IdleManager::new(Arc::clone(&state.shutting_down));
+        let idle_manager =
+            IdleManager::new(Arc::clone(&state.shutting_down), Arc::clone(&state.owner));
 
         idle_manager
             .reset_timeout(
@@ -175,7 +185,8 @@ mod tests {
     #[tokio::test]
     async fn test_reset_timeout_is_skipped_during_shutdown() {
         let state = Arc::new(AppState::new());
-        let idle_manager = IdleManager::new(Arc::clone(&state.shutting_down));
+        let idle_manager =
+            IdleManager::new(Arc::clone(&state.shutting_down), Arc::clone(&state.owner));
 
         assert!(state.mark_shutting_down());
 
