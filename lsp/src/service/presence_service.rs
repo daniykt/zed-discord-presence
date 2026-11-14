@@ -23,41 +23,67 @@ use crate::{
     document::Document,
     error::Result,
     idle::IdleManager,
-    service::{AppState, FileMonitor},
+    service::{AppState, FileMonitor, OwnershipCheck},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 /// How often each instance checks whether it still owns the presence.
 const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Upper bound for how long continuous events can postpone a presence update.
+const UPDATE_MAX_WAIT: Duration = Duration::from_secs(2);
+/// How long a previous owner waits for the new owner's first send before
+/// clearing its own activity anyway.
+const RELEASE_FALLBACK: Duration = Duration::from_secs(3);
 
-/// Remembers the previous ownership check to detect the moment it is lost.
+/// Tracks ownership checks to decide when this instance should release.
 #[derive(Debug)]
 struct OwnershipWatch {
     was_owner: bool,
+    /// Set while waiting for the new owner to send; release no later than this.
+    release_deadline: Option<Instant>,
 }
 
 impl OwnershipWatch {
     fn new(is_owner: bool) -> Self {
         Self {
             was_owner: is_owner,
+            release_deadline: None,
         }
     }
 
-    /// Records a check; returns true only on an owner -> non-owner transition.
-    fn lost_ownership(&mut self, is_owner: bool) -> bool {
-        let lost = self.was_owner && !is_owner;
-        self.was_owner = is_owner;
-        lost
+    /// Records a check and returns true when this instance should release
+    /// now: after losing ownership, once the new owner has sent or the
+    /// fallback timeout has expired. Returns true at most once per loss.
+    fn should_release(&mut self, check: OwnershipCheck, now: Instant) -> bool {
+        if check.is_owner {
+            self.mark_owner();
+            return false;
+        }
+
+        if self.was_owner {
+            self.was_owner = false;
+            self.release_deadline = Some(now + RELEASE_FALLBACK);
+        }
+
+        let Some(deadline) = self.release_deadline else {
+            return false;
+        };
+        if check.owner_has_sent || now >= deadline {
+            self.release_deadline = None;
+            return true;
+        }
+        false
     }
 
     /// Ownership came back before the release ran: keep watching as owner, so
     /// the next loss is detected again.
     fn mark_owner(&mut self) {
         self.was_owner = true;
+        self.release_deadline = None;
     }
 }
 
@@ -69,6 +95,8 @@ pub struct PresenceService {
     debounce_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pending_doc: Arc<Mutex<Option<Document>>>,
     update_debounce: Duration,
+    /// When the oldest event still waiting for the debounce arrived.
+    first_pending_at: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl PresenceService {
@@ -85,6 +113,7 @@ impl PresenceService {
             debounce_handle: Arc::new(Mutex::new(None)),
             pending_doc: Arc::new(Mutex::new(None)),
             update_debounce: config.update_debounce,
+            first_pending_at: Arc::default(),
         }
     }
 
@@ -93,6 +122,17 @@ impl PresenceService {
     }
 
     pub async fn update_presence(&self, doc: Option<Document>) -> Result<()> {
+        self.schedule_update(doc, false).await
+    }
+
+    /// Like `update_presence`, but without the debounce. Used for the first
+    /// event after this instance gains ownership, so the new owner sends at
+    /// once and the previous owner can clear its activity sooner.
+    pub async fn update_presence_now(&self, doc: Option<Document>) -> Result<()> {
+        self.schedule_update(doc, true).await
+    }
+
+    async fn schedule_update(&self, doc: Option<Document>, immediate: bool) -> Result<()> {
         // Store the document for deferred update
         *self.pending_doc.lock().await = doc;
 
@@ -101,21 +141,30 @@ impl PresenceService {
             handle.abort();
         }
 
+        let delay = if immediate {
+            Duration::ZERO
+        } else {
+            self.debounce_delay(Instant::now())
+        };
+
         let state = Arc::clone(&self.state);
         let pending_doc = Arc::clone(&self.pending_doc);
         let debounce_handle = Arc::clone(&self.debounce_handle);
-        let debounce_delay = self.update_debounce;
+        let first_pending_at = Arc::clone(&self.first_pending_at);
         let idle_manager = Arc::clone(&self.idle_manager);
 
         // Spawn debounce task
         let task = tokio::spawn(async move {
-            tokio::time::sleep(debounce_delay).await;
+            tokio::time::sleep(delay).await;
 
             // Get the latest pending doc (might have changed during debounce).
             // Take it in its own statement: in edition 2021 a lock guard in an
             // `if let` scrutinee lives until the end of the block, which made
             // every update_presence call wait for the whole Discord send.
             let doc = pending_doc.lock().await.take();
+            *first_pending_at
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
             if let Some(doc) = doc {
                 let update_start = std::time::Instant::now();
                 if let Err(e) =
@@ -127,7 +176,7 @@ impl PresenceService {
                     info!(
                         "Discord presence updated in {:.1}ms (debounce delay: {:.0}ms)",
                         total_elapsed.as_secs_f64() * 1000.0,
-                        debounce_delay.as_secs_f64() * 1000.0
+                        delay.as_secs_f64() * 1000.0
                     );
                 }
             }
@@ -138,6 +187,21 @@ impl PresenceService {
 
         *self.debounce_handle.lock().await = Some(task);
         Ok(())
+    }
+
+    /// Debounce delay for an event arriving at `now`: the regular debounce,
+    /// shortened so the update never waits more than `UPDATE_MAX_WAIT` after
+    /// the oldest event that is still pending.
+    fn debounce_delay(&self, now: Instant) -> Duration {
+        let mut first_pending_at = self
+            .first_pending_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let first = *first_pending_at.get_or_insert(now);
+        let waited = now.saturating_duration_since(first);
+
+        self.update_debounce
+            .min(UPDATE_MAX_WAIT.saturating_sub(waited))
     }
 
     async fn perform_update_internal(
@@ -197,9 +261,17 @@ impl PresenceService {
 
         let mut discord = state.discord.lock().await;
 
+        // All instances share one session start, so the elapsed timer does
+        // not jump when ownership moves to another instance.
+        discord.set_start_timestamp(Duration::from_millis(state.owner.session_start_ms()));
         discord
             .change_activity_with_reconnect(activity_fields, git_url)
             .await?;
+
+        if discord.has_activity() {
+            // Lets the previous owner clear its own activity now.
+            state.owner.mark_sent();
+        }
 
         Ok(())
     }
@@ -273,7 +345,7 @@ impl PresenceService {
                     break;
                 }
 
-                if watch.lost_ownership(state.owner.is_owner())
+                if watch.should_release(state.owner.check(), Instant::now())
                     && !Self::release_presence(&state).await
                 {
                     watch.mark_owner();
@@ -524,6 +596,27 @@ mod tests {
     const RELEASED: &str = "Released Discord presence";
     /// PID assumed not to belong to any live process; used as "this instance".
     const THIS_PID: u32 = u32::MAX - 11;
+    /// Logged at the start of every `Discord::clear_activity` call.
+    const CLEARED: &str = "Clearing Discord activity";
+
+    const OWNED: OwnershipCheck = OwnershipCheck {
+        is_owner: true,
+        owner_has_sent: true,
+    };
+    const OWNER_HAS_SENT: OwnershipCheck = OwnershipCheck {
+        is_owner: false,
+        owner_has_sent: true,
+    };
+    const OWNER_NOT_SENT: OwnershipCheck = OwnershipCheck {
+        is_owner: false,
+        owner_has_sent: false,
+    };
+
+    fn test_doc(name: &str) -> Document {
+        let workspace_root = std::path::PathBuf::from("C:/test");
+        let url = tower_lsp::lsp_types::Url::from_file_path(workspace_root.join(name)).unwrap();
+        Document::new(&url, &workspace_root, None)
+    }
 
     fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
         let capture = LogCapture::default();
@@ -556,25 +649,41 @@ mod tests {
     }
 
     #[test]
-    fn test_ownership_watch_reports_only_the_transition() {
+    fn test_ownership_watch_releases_once_per_loss() {
+        let now = Instant::now();
         let mut watch = OwnershipWatch::new(true);
 
-        assert!(!watch.lost_ownership(true));
-        assert!(watch.lost_ownership(false));
-        assert!(!watch.lost_ownership(false));
-        assert!(!watch.lost_ownership(true));
-        assert!(watch.lost_ownership(false));
+        assert!(!watch.should_release(OWNED, now));
+        assert!(watch.should_release(OWNER_HAS_SENT, now));
+        assert!(!watch.should_release(OWNER_HAS_SENT, now));
+        assert!(!watch.should_release(OWNED, now));
+        assert!(watch.should_release(OWNER_HAS_SENT, now));
     }
 
     #[test]
     fn test_ownership_watch_detects_loss_again_after_reclaim_during_release() {
+        let now = Instant::now();
         let mut watch = OwnershipWatch::new(true);
-        assert!(watch.lost_ownership(false));
+        assert!(watch.should_release(OWNER_HAS_SENT, now));
 
         // The release found that ownership had already come back.
         watch.mark_owner();
 
-        assert!(watch.lost_ownership(false));
+        assert!(watch.should_release(OWNER_HAS_SENT, now));
+    }
+
+    #[test]
+    fn test_ownership_watch_waits_for_the_owner_send_or_the_fallback() {
+        let start = Instant::now();
+        let mut watch = OwnershipWatch::new(true);
+
+        assert!(!watch.should_release(OWNER_NOT_SENT, start));
+        assert!(!watch.should_release(OWNER_NOT_SENT, start + Duration::from_secs(2)));
+        assert!(watch.should_release(OWNER_NOT_SENT, start + RELEASE_FALLBACK));
+        assert!(
+            !watch.should_release(OWNER_NOT_SENT, start + Duration::from_secs(10)),
+            "Only one release per loss"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -668,9 +777,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_ownership_release_clears_once_and_keeps_the_connection() {
-        // Logged at the start of every Discord::clear_activity call.
-        const CLEARED: &str = "Clearing Discord activity";
-
         let (capture, _guard) = capture_logs();
         let state = owned_state();
         state.discord.lock().await.set_connected_for_test(true);
@@ -685,6 +791,120 @@ mod tests {
             state.discord.lock().await.is_connected(),
             "Release must keep the IPC connection open"
         );
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_first_update_after_gaining_ownership_skips_the_debounce() {
+        let debounced = Arc::new(AppState::new());
+        let immediate = Arc::new(AppState::new());
+        let debounced_service =
+            PresenceService::new(Arc::clone(&debounced), PresenceConfig::default());
+        let immediate_service =
+            PresenceService::new(Arc::clone(&immediate), PresenceConfig::default());
+
+        assert!(debounced_service
+            .update_presence(Some(test_doc("a.rs")))
+            .await
+            .is_ok());
+        assert!(immediate_service
+            .update_presence_now(Some(test_doc("b.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            immediate.last_document.lock().await.is_some(),
+            "The immediate update must run without the debounce"
+        );
+        assert!(
+            debounced.last_document.lock().await.is_none(),
+            "A regular update still waits for the debounce"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_debounce_max_wait_caps_the_delay_under_continuous_events() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        let start = Instant::now();
+
+        // An event every 300 ms keeps restarting the 500 ms debounce.
+        let mut updated_after = None;
+        for i in 0..20 {
+            assert!(service
+                .update_presence(Some(test_doc(&format!("file{i}.rs"))))
+                .await
+                .is_ok());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            if state.last_document.lock().await.is_some() {
+                updated_after = Some(start.elapsed());
+                break;
+            }
+        }
+
+        let updated_after =
+            updated_after.expect("Continuous events must not postpone the update forever");
+        assert!(
+            updated_after <= UPDATE_MAX_WAIT + Duration::from_millis(300),
+            "Update ran after {updated_after:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_non_owner_waits_for_the_owner_send_before_clearing() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        state.discord.lock().await.set_connected_for_test(true);
+        let _service = start_watch(&state).await;
+
+        // A live instance (the test process) claims but has not sent yet.
+        let other = std::process::id();
+        state.owner.set_record_fields(other, 1_000, 0);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(capture.count(CLEARED), 0, "Owner has not sent yet");
+
+        state.owner.set_record_fields(other, 1_000, 2_000);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(capture.count(CLEARED), 1, "Clear once the owner has sent");
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_non_owner_clears_after_the_fallback_if_the_owner_never_sends() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        state.discord.lock().await.set_connected_for_test(true);
+        let _service = start_watch(&state).await;
+
+        state.owner.set_record_fields(std::process::id(), 1_000, 0);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(capture.count(CLEARED), 0);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            capture.count(CLEARED),
+            1,
+            "Fallback must clear a stale presence"
+        );
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_update_sends_the_shared_session_start() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        assert!(state.owner.claim());
+
+        assert!(service
+            .update_presence_now(Some(test_doc("a.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let session = Duration::from_millis(state.owner.session_start_ms());
+        assert_eq!(state.discord.lock().await.start_timestamp(), session);
         state.owner.remove_record();
     }
 }

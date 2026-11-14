@@ -23,7 +23,7 @@ mod presence_service;
 mod workspace_service;
 
 pub use file_monitor::FileMonitor;
-pub use owner::PresenceOwner;
+pub use owner::{OwnershipCheck, PresenceOwner};
 pub use presence_service::PresenceService;
 pub use workspace_service::WorkspaceService;
 

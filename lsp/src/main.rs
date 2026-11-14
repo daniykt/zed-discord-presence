@@ -82,7 +82,7 @@ impl Backend {
         debug!("Document changed");
         // Only reached from user-driven events (open, change, save, cursor
         // highlight), never from the polling loop, so it is safe to claim here.
-        self.app_state.owner.claim();
+        let acquired = self.app_state.owner.claim();
 
         let doc = {
             let workspace = self.app_state.workspace.lock().await;
@@ -91,7 +91,15 @@ impl Backend {
             Document::new(uri, workspace_path, line_number)
         };
 
-        if let Err(e) = self.presence_service.update_presence(Some(doc)).await {
+        let result = if acquired {
+            // First event after gaining ownership: skip the debounce so the
+            // previous owner can clear its activity sooner.
+            self.presence_service.update_presence_now(Some(doc)).await
+        } else {
+            self.presence_service.update_presence(Some(doc)).await
+        };
+
+        if let Err(e) = result {
             error!("Failed to update presence: {}", e);
         } else {
             debug!("Presence updated successfully");

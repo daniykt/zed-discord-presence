@@ -199,6 +199,16 @@ impl Discord {
         self.client.is_some()
     }
 
+    /// Sets the start of the elapsed timer sent with every activity.
+    pub fn set_start_timestamp(&mut self, start: Duration) {
+        self.start_timestamp = start;
+    }
+
+    /// Whether this connection shows an activity sent by this instance.
+    pub fn has_activity(&self) -> bool {
+        lock_gate(&self.send_gate).last_activity.is_some()
+    }
+
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
@@ -603,6 +613,11 @@ impl Discord {
     #[cfg(test)]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
         self.connected.store(connected, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_timestamp(&self) -> Duration {
+        self.start_timestamp
     }
 }
 

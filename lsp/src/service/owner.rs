@@ -1,26 +1,84 @@
 //! Decides which language server instance owns the Discord presence.
 //!
 //! Zed starts one server per worktree, and each one has its own Discord IPC
-//! connection. The instance that saw the most recent user event records its
-//! PID in a small file under the OS temp directory; the others stay quiet.
+//! connection. The instance that saw the most recent user event records
+//! itself in a small file under the OS temp directory; the others stay quiet.
+//! The record also says when the owner first sent after claiming, so the
+//! previous owner can wait for it before clearing, and holds a session start
+//! shared by all instances, so the elapsed timer survives handovers.
 //! Every failure fails open: an IO error never blocks the presence.
 
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex as StdMutex, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-/// A claim is not rewritten more often than this while we still own the file.
-const CLAIM_THROTTLE: Duration = Duration::from_secs(1);
+/// Contents of the ownership record.
+///
+/// Format: `<pid> <claim_ms> <sent_ms> <session_ms>`, in unix milliseconds;
+/// `sent_ms` is 0 until the owner has sent and `session_ms` 0 if unknown.
+/// Older versions wrote only `<pid> <claim_ms>`; missing fields read as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnerRecord {
+    pid: u32,
+    claim_ms: u64,
+    sent_ms: Option<u64>,
+    session_ms: Option<u64>,
+}
+
+impl OwnerRecord {
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields = text.split_whitespace();
+        let pid = fields.next()?.parse().ok()?;
+        let mut next_ms = || fields.next().and_then(|field| field.parse::<u64>().ok());
+
+        let claim_ms = next_ms().unwrap_or(0);
+        let sent_ms = next_ms();
+        let session_ms = next_ms().filter(|&ms| ms > 0);
+
+        Some(Self {
+            pid,
+            claim_ms,
+            sent_ms,
+            session_ms,
+        })
+    }
+
+    fn format(&self) -> String {
+        format!(
+            "{} {} {} {}\n",
+            self.pid,
+            self.claim_ms,
+            self.sent_ms.unwrap_or(0),
+            self.session_ms.unwrap_or(0)
+        )
+    }
+
+    /// Whether the owner has sent since it claimed. Records from older
+    /// versions cannot tell, so they count as sent (fail open).
+    fn owner_has_sent(&self) -> bool {
+        self.sent_ms
+            .is_none_or(|sent_ms| sent_ms > 0 && sent_ms >= self.claim_ms)
+    }
+}
+
+/// Result of one ownership check, taken from a single read of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnershipCheck {
+    pub is_owner: bool,
+    /// Whether the current owner has already sent its presence. Always true
+    /// when this process is the owner or the record cannot tell.
+    pub owner_has_sent: bool,
+}
 
 #[derive(Debug)]
 pub struct PresenceOwner {
     path: PathBuf,
     pid: u32,
-    last_claim: StdMutex<Option<Instant>>,
+    /// Session start last seen in a live record, or chosen by this process.
+    session_ms: StdMutex<Option<u64>>,
 }
 
 impl PresenceOwner {
@@ -33,29 +91,41 @@ impl PresenceOwner {
         Self {
             path,
             pid,
-            last_claim: StdMutex::new(None),
+            session_ms: StdMutex::new(None),
         }
     }
 
-    /// Records this process as the presence owner. Skips the write if this
-    /// process wrote less than `CLAIM_THROTTLE` ago and the file still names it,
-    /// so returning to an instance always takes ownership back immediately.
-    pub fn claim(&self) {
-        let now = Instant::now();
-        let mut last_claim = self
-            .last_claim
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-
-        let recently_claimed =
-            last_claim.is_some_and(|claimed_at| now.duration_since(claimed_at) < CLAIM_THROTTLE);
-        if recently_claimed && self.read_owner() == Some(self.pid) {
-            return;
+    /// Records this process as the owner unless the record already names it.
+    /// Returns true when ownership was just acquired. Nothing is written while
+    /// this process already owns the record, so `claim_ms` keeps the moment
+    /// ownership was acquired.
+    pub fn claim(&self) -> bool {
+        if self
+            .read_live_record()
+            .is_some_and(|(record, _)| record.pid == self.pid)
+        {
+            return false;
         }
 
-        match self.write_record() {
-            Ok(()) => *last_claim = Some(now),
-            Err(e) => debug!("Failed to claim presence ownership: {}", e),
+        // Reading a live record above already cached its session start.
+        let now = unix_ms();
+        let session_ms = self.cached_session().unwrap_or(now);
+        let record = OwnerRecord {
+            pid: self.pid,
+            claim_ms: now,
+            sent_ms: Some(0),
+            session_ms: Some(session_ms),
+        };
+
+        match self.write_record(&record) {
+            Ok(()) => {
+                self.cache_session(session_ms);
+                true
+            }
+            Err(e) => {
+                debug!("Failed to claim presence ownership: {}", e);
+                false
+            }
         }
     }
 
@@ -64,31 +134,94 @@ impl PresenceOwner {
     /// is missing or unreadable.
     #[must_use]
     pub fn is_owner(&self) -> bool {
-        match self.read_owner() {
-            None => true,
-            Some(pid) if pid == self.pid => true,
-            Some(pid) => !process_alive(pid),
+        self.check().is_owner
+    }
+
+    #[must_use]
+    pub fn check(&self) -> OwnershipCheck {
+        match self.read_live_record() {
+            None => OwnershipCheck {
+                is_owner: true,
+                owner_has_sent: true,
+            },
+            Some((record, alive)) => {
+                let is_owner = record.pid == self.pid || !alive;
+                OwnershipCheck {
+                    is_owner,
+                    owner_has_sent: is_owner || record.owner_has_sent(),
+                }
+            }
         }
     }
 
-    fn read_owner(&self) -> Option<u32> {
-        let record = fs::read_to_string(&self.path).ok()?;
-        record.split_whitespace().next()?.parse().ok()
+    /// Notes that this process, as the owner, has sent its presence. Only the
+    /// first send after acquiring ownership is written: that is all a previous
+    /// owner waits for before clearing its own activity.
+    pub fn mark_sent(&self) {
+        let Some((record, _)) = self.read_live_record() else {
+            return;
+        };
+        if record.pid != self.pid || record.owner_has_sent() {
+            return;
+        }
+
+        // Never earlier than the claim, even if the clock went backwards.
+        let sent = OwnerRecord {
+            sent_ms: Some(unix_ms().max(record.claim_ms)),
+            ..record
+        };
+        if let Err(e) = self.write_record(&sent) {
+            debug!("Failed to record the presence send: {}", e);
+        }
     }
 
-    /// Writes `<pid> <unix_ms>` atomically (temp file + rename), so readers
-    /// never observe a partial record.
-    fn write_record(&self) -> io::Result<()> {
+    /// Start of the elapsed timer (unix ms), shared by all instances: the
+    /// session of a live record, else the last one this process saw, else now.
+    pub fn session_start_ms(&self) -> u64 {
+        // Refreshes the cached session from a live record, if any.
+        let _ = self.read_live_record();
+        *self
+            .session_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(unix_ms)
+    }
+
+    /// Reads the record and whether its owner is this process or still alive.
+    /// The session of a live record is cached, so it outlives its owner.
+    fn read_live_record(&self) -> Option<(OwnerRecord, bool)> {
+        let record = OwnerRecord::parse(&fs::read_to_string(&self.path).ok()?)?;
+        let alive = record.pid == self.pid || process_alive(record.pid);
+
+        if let Some(session_ms) = record.session_ms.filter(|_| alive) {
+            self.cache_session(session_ms);
+        }
+        Some((record, alive))
+    }
+
+    fn cached_session(&self) -> Option<u64> {
+        *self
+            .session_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cache_session(&self, session_ms: u64) {
+        *self
+            .session_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(session_ms);
+    }
+
+    /// Writes the record atomically (temp file + rename), so readers never
+    /// observe a partial record.
+    fn write_record(&self, record: &OwnerRecord) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
 
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis());
         let tmp_path = self.path.with_extension(format!("{}.tmp", self.pid));
-
-        fs::write(&tmp_path, format!("{} {unix_ms}\n", self.pid))?;
+        fs::write(&tmp_path, record.format())?;
         fs::rename(&tmp_path, &self.path)
     }
 }
@@ -97,6 +230,14 @@ impl Default for PresenceOwner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(not(test))]
@@ -187,10 +328,23 @@ impl PresenceOwner {
         Self::with_path(default_path(), pid)
     }
 
-    /// Overwrites the record as if the instance with `pid` had claimed it.
+    /// Overwrites the record in the old `<pid> <claim_ms>` format, as if an
+    /// older version with `pid` had claimed it.
     pub(crate) fn set_record_owner(&self, pid: u32) {
         fs::create_dir_all(self.path.parent().unwrap()).unwrap();
         fs::write(&self.path, format!("{pid} 0\n")).unwrap();
+    }
+
+    /// Overwrites the record in the current format (no session start).
+    pub(crate) fn set_record_fields(&self, pid: u32, claim_ms: u64, sent_ms: u64) {
+        let record = OwnerRecord {
+            pid,
+            claim_ms,
+            sent_ms: Some(sent_ms),
+            session_ms: None,
+        };
+        fs::create_dir_all(self.path.parent().unwrap()).unwrap();
+        fs::write(&self.path, record.format()).unwrap();
     }
 
     /// Deletes the record and its test directory.
@@ -219,7 +373,7 @@ pub(crate) fn dead_test_pid() -> u32 {
 mod tests {
     use super::*;
 
-    /// A PID that is assumed not to belong to the test process.
+    /// A PID that is assumed not to belong to any live process.
     const OTHER_PID: u32 = u32::MAX - 7;
 
     fn test_owner(pid: u32) -> PresenceOwner {
@@ -279,32 +433,31 @@ mod tests {
         cleanup(&owner);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_claim_is_throttled_while_still_owner() {
+    #[test]
+    fn test_claim_reports_acquisition_only_once() {
         let owner = test_owner(OTHER_PID);
-        owner.claim();
-        assert!(owner.is_owner());
 
-        // Same PID with a marker timestamp: a rewrite would replace the marker.
-        let marker = format!("{OTHER_PID} 0\n");
-        write_raw(&owner, &marker);
-
-        tokio::time::advance(Duration::from_millis(500)).await;
-        owner.claim();
-        assert_eq!(
-            read_raw(&owner),
-            marker,
-            "Claim within 1 s should not write"
-        );
-
-        tokio::time::advance(CLAIM_THROTTLE).await;
-        owner.claim();
-        assert_ne!(read_raw(&owner), marker, "Claim after 1 s should write");
+        assert!(owner.claim(), "First claim acquires ownership");
+        assert!(!owner.claim(), "Already the owner: nothing acquired");
         cleanup(&owner);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_claim_retakes_ownership_within_throttle_window() {
+    #[test]
+    fn test_claim_does_not_rewrite_while_still_owner() {
+        let owner = test_owner(OTHER_PID);
+        assert!(owner.claim());
+
+        // Same PID with marker values: a rewrite would replace them.
+        let marker = format!("{OTHER_PID} 1 0 7\n");
+        write_raw(&owner, &marker);
+        owner.claim();
+
+        assert_eq!(read_raw(&owner), marker);
+        cleanup(&owner);
+    }
+
+    #[test]
+    fn test_claim_retakes_ownership_immediately() {
         let owner = test_owner(OTHER_PID);
         owner.claim();
 
@@ -312,13 +465,81 @@ mod tests {
         write_raw(&owner, &format!("{} 0\n", std::process::id()));
         assert!(!owner.is_owner());
 
-        tokio::time::advance(Duration::from_millis(100)).await;
-        owner.claim();
-
         assert!(
-            owner.is_owner(),
+            owner.claim(),
             "Returning to an instance must reclaim at once"
         );
+        assert!(owner.is_owner());
+        cleanup(&owner);
+    }
+
+    #[test]
+    fn test_owner_has_sent_only_after_mark_sent() {
+        let path = default_path();
+        let new_owner = PresenceOwner::with_path(path.clone(), std::process::id());
+        let old_owner = PresenceOwner::with_path(path, OTHER_PID);
+
+        assert!(new_owner.claim());
+        let before = old_owner.check();
+        assert!(!before.is_owner);
+        assert!(!before.owner_has_sent, "Claimed but not sent yet");
+
+        new_owner.mark_sent();
+
+        assert!(old_owner.check().owner_has_sent);
+        cleanup(&new_owner);
+    }
+
+    #[test]
+    fn test_old_record_format_counts_as_sent() {
+        let owner = test_owner(OTHER_PID);
+        write_raw(&owner, &format!("{} 123\n", std::process::id()));
+
+        let check = owner.check();
+
+        assert!(!check.is_owner);
+        assert!(check.owner_has_sent, "Old records cannot tell: fail open");
+        cleanup(&owner);
+    }
+
+    #[test]
+    fn test_instances_share_the_session_start() {
+        let path = default_path();
+        let first = PresenceOwner::with_path(path.clone(), std::process::id());
+        let second = PresenceOwner::with_path(path, OTHER_PID);
+
+        assert!(first.claim());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The first owner is alive, so the second one keeps its session.
+        assert!(second.claim());
+
+        assert_eq!(first.session_start_ms(), second.session_start_ms());
+        cleanup(&first);
+    }
+
+    #[test]
+    fn test_new_session_when_unknown_owner_is_dead() {
+        let owner = test_owner(OTHER_PID);
+        write_raw(&owner, &format!("{} 1 1 42\n", dead_test_pid()));
+
+        assert!(owner.claim());
+
+        assert_ne!(owner.session_start_ms(), 42);
+        cleanup(&owner);
+    }
+
+    #[test]
+    fn test_session_survives_the_owner_when_seen_before() {
+        let owner = test_owner(OTHER_PID);
+        // A live owner's session is cached on read...
+        write_raw(&owner, &format!("{} 1 1 42\n", std::process::id()));
+        assert!(!owner.is_owner());
+
+        // ...and kept after that owner is gone.
+        write_raw(&owner, &format!("{} 1 1 42\n", dead_test_pid()));
+        assert!(owner.claim());
+
+        assert_eq!(owner.session_start_ms(), 42);
         cleanup(&owner);
     }
 }
