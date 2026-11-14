@@ -111,8 +111,12 @@ impl PresenceService {
         let task = tokio::spawn(async move {
             tokio::time::sleep(debounce_delay).await;
 
-            // Get the latest pending doc (might have changed during debounce)
-            if let Some(doc) = pending_doc.lock().await.take() {
+            // Get the latest pending doc (might have changed during debounce).
+            // Take it in its own statement: in edition 2021 a lock guard in an
+            // `if let` scrutinee lives until the end of the block, which made
+            // every update_presence call wait for the whole Discord send.
+            let doc = pending_doc.lock().await.take();
+            if let Some(doc) = doc {
                 let update_start = std::time::Instant::now();
                 if let Err(e) =
                     Self::perform_update_internal(&state, &idle_manager, Some(doc)).await
@@ -281,7 +285,7 @@ impl PresenceService {
     /// Releases this instance's presence. Returns false, without releasing, if
     /// ownership came back (or shutdown started) while waiting for the lock.
     async fn release_presence(state: &AppState) -> bool {
-        let discord = state.discord.lock().await;
+        let mut discord = state.discord.lock().await;
 
         // A user event may have reclaimed ownership while this task waited:
         // releasing now would drop the update this instance just sent.
@@ -526,6 +530,7 @@ mod tests {
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .finish();
         (capture, tracing::subscriber::set_default(subscriber))
@@ -624,6 +629,62 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         assert_eq!(capture.count(RELEASED), 0);
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_update_presence_does_not_wait_for_a_slow_discord_send() {
+        use std::path::PathBuf;
+        use tower_lsp::lsp_types::Url;
+
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        let workspace_root = PathBuf::from("C:/test");
+        let doc = |name: &str| {
+            let url = Url::from_file_path(workspace_root.join(name)).unwrap();
+            Document::new(&url, &workspace_root, None)
+        };
+
+        // Holding the Discord lock simulates a slow connect or send in progress.
+        let discord_busy = state.discord.lock().await;
+
+        assert!(service.update_presence(Some(doc("first.rs"))).await.is_ok());
+        // Let the debounce expire so the update task blocks on the Discord lock.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // A new editor event must not wait for that send to finish.
+        let second_update = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.update_presence(Some(doc("second.rs"))),
+        )
+        .await;
+        assert!(
+            second_update.is_ok(),
+            "update_presence must not wait for the Discord lock"
+        );
+
+        drop(discord_busy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ownership_release_clears_once_and_keeps_the_connection() {
+        // Logged at the start of every Discord::clear_activity call.
+        const CLEARED: &str = "Clearing Discord activity";
+
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        state.discord.lock().await.set_connected_for_test(true);
+        let _service = start_watch(&state).await;
+
+        // The test process itself plays the other, live instance.
+        state.owner.set_record_owner(std::process::id());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(capture.count(CLEARED), 1, "Clear once on the transition");
+        assert!(
+            state.discord.lock().await.is_connected(),
+            "Release must keep the IPC connection open"
+        );
         state.owner.remove_record();
     }
 }

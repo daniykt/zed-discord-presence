@@ -39,6 +39,8 @@ const MAX_RETRIES: u32 = 5;
 const INITIAL_DELAY_MS: u64 = 500;
 /// Maximum delay between retries in milliseconds
 const MAX_DELAY_MS: u64 = 10_000;
+/// Upper bound for opening the IPC pipe and completing the handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// An identical activity is skipped while its last send is younger than this.
 /// Once older, it is sent again to re-assert the presence (e.g. after a Discord
 /// restart) and to surface a broken pipe through the failed write.
@@ -229,16 +231,35 @@ impl Discord {
 
         debug!("Connecting to Discord IPC");
 
-        let mut client = self.get_client().await?;
-        client.connect().map_err(|e| {
-            self.connected.store(false, Ordering::SeqCst);
-            error!("Failed to connect to Discord IPC: {}", e);
-            crate::error::PresenceError::Discord(format!("Failed to connect to Discord IPC: {e}"))
-        })?;
+        let client = Arc::clone(self.client.as_ref().ok_or_else(|| {
+            crate::error::PresenceError::Discord("Discord client not initialized".to_string())
+        })?);
 
-        self.connected.store(true, Ordering::SeqCst);
-        info!("Successfully connected to Discord IPC");
-        Ok(())
+        // The crate's connect is blocking pipe IO (open + handshake read). Run
+        // it on the blocking pool so it never stalls a runtime worker, and
+        // bound it, including the wait for the client lock. On timeout the
+        // blocking call may hold the client lock until it returns; later
+        // attempts then time out too instead of hanging.
+        let attempt = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+            let mut client = client.lock_owned().await;
+            tokio::task::spawn_blocking(move || client.connect()).await
+        })
+        .await;
+
+        let failure = match attempt {
+            Ok(Ok(Ok(()))) => {
+                self.connected.store(true, Ordering::SeqCst);
+                info!("Successfully connected to Discord IPC");
+                return Ok(());
+            }
+            Ok(Ok(Err(e))) => format!("Failed to connect to Discord IPC: {e}"),
+            Ok(Err(e)) => format!("Discord IPC connect task failed: {e}"),
+            Err(_) => format!("Timed out connecting to Discord IPC after {CONNECT_TIMEOUT:?}"),
+        };
+
+        self.connected.store(false, Ordering::SeqCst);
+        error!("{}", failure);
+        Err(crate::error::PresenceError::Discord(failure))
     }
 
     /// Connects to Discord IPC with exponential backoff retry.
@@ -560,22 +581,28 @@ impl Discord {
 
     /// Gives up this instance's presence after another instance took ownership.
     ///
-    /// Closing the IPC connection makes Discord drop the activity set through
-    /// it, which unmasks the owner's activity. No explicit clear is sent: only
-    /// this connection's activity has to go away. The last activity is
-    /// forgotten so the first update after reconnecting is not skipped as
-    /// identical; `change_activity_with_reconnect` reconnects lazily.
-    pub async fn release(&self) -> Result<()> {
-        lock_gate(&self.send_gate).forget_last_activity();
-
+    /// Clears this connection's activity, which unmasks the owner's, but keeps
+    /// the IPC connection open so regaining ownership needs no new handshake.
+    /// Pending sends are cancelled and the last activity is forgotten, so the
+    /// first update after regaining ownership is not skipped as identical.
+    pub async fn release(&mut self) -> Result<()> {
         if !self.is_connected() {
-            // Nothing open to close, but a deferred send must not go out.
-            lock_gate(&self.send_gate).cancel_pending();
+            // Nothing to clear, but a deferred send must not go out.
+            let mut gate = lock_gate(&self.send_gate);
+            gate.cancel_pending();
+            gate.forget_last_activity();
             return Ok(());
         }
 
-        info!("Releasing the Discord IPC connection of a non-owner instance");
-        self.kill().await
+        info!("Clearing the activity of a non-owner instance");
+        // clear_activity also cancels pending sends and forgets the last activity.
+        self.clear_activity().await
+    }
+
+    /// Sets the connection flag without a real Discord client.
+    #[cfg(test)]
+    pub(crate) fn set_connected_for_test(&self, connected: bool) {
+        self.connected.store(connected, Ordering::SeqCst);
     }
 }
 
@@ -788,7 +815,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_release_lets_the_next_identical_update_be_sent() {
-        let discord = Discord::new(shutdown_signal(false));
+        let mut discord = Discord::new(shutdown_signal(false));
+        // Connected, so release goes through clear_activity and keeps the link.
+        discord.connected.store(true, Ordering::SeqCst);
         let coding = activity_with_state("coding");
         lock_gate(&discord.send_gate).record_sent(coding.clone(), Instant::now());
 
@@ -805,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_release_cancels_pending_send_and_marks_disconnected() {
+    async fn test_release_cancels_pending_send_and_keeps_the_connection() {
         let mut discord = Discord::new(shutdown_signal(false));
         discord.connected.store(true, Ordering::SeqCst);
         lock_gate(&discord.send_gate).record_sent(activity_with_state("first"), Instant::now());
@@ -817,10 +846,26 @@ mod tests {
             .is_ok());
         assert!(discord.release().await.is_ok());
 
-        // Disconnected, so the next change_activity_with_reconnect reconnects.
-        assert!(!discord.is_connected());
+        // Still connected: regaining ownership needs no new handshake.
+        assert!(discord.is_connected());
         let gate = lock_gate(&discord.send_gate);
         assert!(gate.pending.is_none());
         assert!(gate.flush_at.is_none());
+        assert!(gate.last_activity.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_times_out_instead_of_waiting_forever() {
+        let mut discord = Discord::new(shutdown_signal(false));
+        discord.create_client("0").unwrap();
+
+        // Holding the client lock simulates a handshake that never returns.
+        let stuck_handshake = discord.get_client().await.unwrap();
+
+        let error = discord.connect().await.unwrap_err();
+
+        assert!(error.to_string().contains("Timed out"));
+        assert!(!discord.is_connected());
+        drop(stuck_handshake);
     }
 }
