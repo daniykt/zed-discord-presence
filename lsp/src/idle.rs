@@ -113,6 +113,12 @@ impl IdleManager {
                     }
                 }
                 IdleAction::ChangeActivity => {
+                    // The idle send reuses whatever start timestamp this
+                    // instance last set; it does not refresh it.
+                    debug!(
+                        "Idle action: sending the idle activity (pid {})",
+                        std::process::id()
+                    );
                     let doc = last_document.lock().await;
                     let doc = doc.as_ref();
 

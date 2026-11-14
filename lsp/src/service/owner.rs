@@ -100,16 +100,17 @@ impl PresenceOwner {
     /// this process already owns the record, so `claim_ms` keeps the moment
     /// ownership was acquired.
     pub fn claim(&self) -> bool {
-        if self
-            .read_live_record()
-            .is_some_and(|(record, _)| record.pid == self.pid)
-        {
+        let live = self.read_live_record();
+        if live.is_some_and(|(record, _)| record.pid == self.pid) {
             return false;
         }
 
         // Reading a live record above already cached its session start.
         let now = unix_ms();
-        let session_ms = self.cached_session().unwrap_or(now);
+        let cached = self.cached_session();
+        let session_ms = cached.unwrap_or(now);
+        // Only used to log where the session start came from.
+        let inherited = live.is_some_and(|(record, alive)| alive && record.session_ms.is_some());
         let record = OwnerRecord {
             pid: self.pid,
             claim_ms: now,
@@ -120,6 +121,19 @@ impl PresenceOwner {
         match self.write_record(&record) {
             Ok(()) => {
                 self.cache_session(session_ms);
+                debug!(
+                    "Claimed presence ownership: pid={} claim_ms={} session_ms={} (source: {})",
+                    self.pid,
+                    now,
+                    session_ms,
+                    if inherited {
+                        "live owner record"
+                    } else if cached.is_some() {
+                        "cached by this process"
+                    } else {
+                        "new session"
+                    }
+                );
                 true
             }
             Err(e) => {
@@ -230,6 +244,14 @@ impl Default for PresenceOwner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Session start stored in the ownership record, read without liveness
+/// checks or caching. For diagnostics only.
+#[must_use]
+pub fn recorded_session_ms() -> Option<u64> {
+    let text = fs::read_to_string(default_path()).ok()?;
+    OwnerRecord::parse(&text)?.session_ms
 }
 
 fn unix_ms() -> u64 {

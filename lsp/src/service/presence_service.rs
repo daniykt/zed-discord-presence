@@ -263,7 +263,13 @@ impl PresenceService {
 
         // All instances share one session start, so the elapsed timer does
         // not jump when ownership moves to another instance.
-        discord.set_start_timestamp(Duration::from_millis(state.owner.session_start_ms()));
+        let session_ms = state.owner.session_start_ms();
+        debug!(
+            "Using shared session start {} ms as timestamps.start (pid {})",
+            session_ms,
+            std::process::id()
+        );
+        discord.set_start_timestamp(Duration::from_millis(session_ms));
         discord
             .change_activity_with_reconnect(activity_fields, git_url)
             .await?;

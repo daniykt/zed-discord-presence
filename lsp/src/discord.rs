@@ -390,6 +390,7 @@ impl Discord {
             crate::error::PresenceError::Discord(format!("Failed to clear activity: {e}"))
         })?;
 
+        debug!("SET_ACTIVITY clear written: pid={}", std::process::id());
         info!("Discord activity cleared");
         Ok(())
     }
@@ -426,11 +427,20 @@ impl Discord {
             }
         }
 
+        // Only used to label the write in the debug log.
+        let path = match lock_gate(&self.send_gate).last_activity.as_ref() {
+            None => "first-on-connection",
+            Some(last) if *last == activity => "re-assert",
+            Some(_) => "immediate",
+        };
+
         let mut client = self.get_client().await?;
-        Self::send_activity(&mut client, &activity, self.start_timestamp).inspect_err(|_| {
-            // Mark as disconnected so next attempt will reconnect
-            self.connected.store(false, Ordering::SeqCst);
-        })?;
+        Self::send_activity(&mut client, &activity, self.start_timestamp, path).inspect_err(
+            |_| {
+                // Mark as disconnected so next attempt will reconnect
+                self.connected.store(false, Ordering::SeqCst);
+            },
+        )?;
         drop(client);
 
         lock_gate(&self.send_gate).record_sent(activity, Instant::now());
@@ -444,6 +454,7 @@ impl Discord {
         client: &mut DiscordIpcClient,
         (activity_fields, git_remote_url): &ActivityKey,
         start_timestamp: Duration,
+        path: &str,
     ) -> Result<()> {
         let timestamp: i64 = i64::try_from(start_timestamp.as_millis()).map_err(|e| {
             error!("Failed to convert timestamp: {}", e);
@@ -493,7 +504,20 @@ impl Discord {
         client.set_activity(activity).map_err(|e| {
             error!("Failed to set activity: {}", e);
             crate::error::PresenceError::Discord(format!("Failed to set activity: {e}"))
-        })
+        })?;
+
+        // Reading the record costs a file read, so only do it when logged.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "SET_ACTIVITY written: path={} pid={} timestamps.start={} (unit: ms, {} s) recorded_session_ms={:?}",
+                path,
+                std::process::id(),
+                timestamp,
+                timestamp / 1000,
+                crate::service::recorded_session_ms()
+            );
+        }
+        Ok(())
     }
 
     /// Spawns the task that sends the pending activity once the minimum send
@@ -524,7 +548,9 @@ impl Discord {
                 };
 
                 let mut client = client.lock().await;
-                if let Err(e) = Self::send_activity(&mut client, &activity, start_timestamp) {
+                if let Err(e) =
+                    Self::send_activity(&mut client, &activity, start_timestamp, "deferred")
+                {
                     warn!(
                         "Deferred activity update failed, marking as disconnected: {}",
                         e
@@ -574,6 +600,10 @@ impl Discord {
                 debug!("Reconnection failed: {}", e);
                 return Err(e);
             }
+            debug!(
+                "Reconnected (pid {}); the next write is the first on this connection",
+                std::process::id()
+            );
         }
 
         // Try to update activity
