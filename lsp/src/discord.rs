@@ -557,6 +557,26 @@ impl Discord {
             }
         }
     }
+
+    /// Gives up this instance's presence after another instance took ownership.
+    ///
+    /// Closing the IPC connection makes Discord drop the activity set through
+    /// it, which unmasks the owner's activity. No explicit clear is sent: only
+    /// this connection's activity has to go away. The last activity is
+    /// forgotten so the first update after reconnecting is not skipped as
+    /// identical; `change_activity_with_reconnect` reconnects lazily.
+    pub async fn release(&self) -> Result<()> {
+        lock_gate(&self.send_gate).forget_last_activity();
+
+        if !self.is_connected() {
+            // Nothing open to close, but a deferred send must not go out.
+            lock_gate(&self.send_gate).cancel_pending();
+            return Ok(());
+        }
+
+        info!("Releasing the Discord IPC connection of a non-owner instance");
+        self.kill().await
+    }
 }
 
 #[cfg(test)]
@@ -764,5 +784,43 @@ mod tests {
         assert!(gate.pending.is_none());
         assert!(gate.flush_at.is_none());
         assert!(gate.last_activity.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_release_lets_the_next_identical_update_be_sent() {
+        let discord = Discord::new(shutdown_signal(false));
+        let coding = activity_with_state("coding");
+        lock_gate(&discord.send_gate).record_sent(coding.clone(), Instant::now());
+
+        // Past the minimum interval but inside the re-assert window, an
+        // identical activity is normally skipped.
+        tokio::time::advance(MIN_SEND_INTERVAL).await;
+        let before_release = lock_gate(&discord.send_gate).decide(&coding, Instant::now());
+        assert_eq!(before_release, SendDecision::Skip);
+
+        assert!(discord.release().await.is_ok());
+
+        let after_release = lock_gate(&discord.send_gate).decide(&coding, Instant::now());
+        assert_eq!(after_release, SendDecision::Send);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_release_cancels_pending_send_and_marks_disconnected() {
+        let mut discord = Discord::new(shutdown_signal(false));
+        discord.connected.store(true, Ordering::SeqCst);
+        lock_gate(&discord.send_gate).record_sent(activity_with_state("first"), Instant::now());
+
+        let (fields, git_remote_url) = activity_with_state("second");
+        assert!(discord
+            .change_activity(fields, git_remote_url)
+            .await
+            .is_ok());
+        assert!(discord.release().await.is_ok());
+
+        // Disconnected, so the next change_activity_with_reconnect reconnects.
+        assert!(!discord.is_connected());
+        let gate = lock_gate(&discord.send_gate);
+        assert!(gate.pending.is_none());
+        assert!(gate.flush_at.is_none());
     }
 }

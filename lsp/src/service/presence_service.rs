@@ -28,7 +28,38 @@ use crate::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
+
+/// How often each instance checks whether it still owns the presence.
+const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Remembers the previous ownership check to detect the moment it is lost.
+#[derive(Debug)]
+struct OwnershipWatch {
+    was_owner: bool,
+}
+
+impl OwnershipWatch {
+    fn new(is_owner: bool) -> Self {
+        Self {
+            was_owner: is_owner,
+        }
+    }
+
+    /// Records a check; returns true only on an owner -> non-owner transition.
+    fn lost_ownership(&mut self, is_owner: bool) -> bool {
+        let lost = self.was_owner && !is_owner;
+        self.was_owner = is_owner;
+        lost
+    }
+
+    /// Ownership came back before the release ran: keep watching as owner, so
+    /// the next loss is detected again.
+    fn mark_owner(&mut self) {
+        self.was_owner = true;
+    }
+}
 
 #[derive(Debug)]
 pub struct PresenceService {
@@ -220,6 +251,51 @@ impl PresenceService {
         Ok(())
     }
 
+    /// Spawns the task that releases this instance's Discord connection when
+    /// another instance takes over the presence. While its connection stays
+    /// open, Discord keeps showing its activity and masks the owner's.
+    pub fn start_ownership_watch(&self) {
+        let state = Arc::clone(&self.state);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(OWNERSHIP_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut watch = OwnershipWatch::new(state.owner.is_owner());
+
+            loop {
+                interval.tick().await;
+                if state.is_shutting_down() {
+                    debug!("Ownership watch shutting down");
+                    break;
+                }
+
+                if watch.lost_ownership(state.owner.is_owner())
+                    && !Self::release_presence(&state).await
+                {
+                    watch.mark_owner();
+                }
+            }
+        });
+    }
+
+    /// Releases this instance's presence. Returns false, without releasing, if
+    /// ownership came back (or shutdown started) while waiting for the lock.
+    async fn release_presence(state: &AppState) -> bool {
+        let discord = state.discord.lock().await;
+
+        // A user event may have reclaimed ownership while this task waited:
+        // releasing now would drop the update this instance just sent.
+        if state.owner.is_owner() || state.is_shutting_down() {
+            return false;
+        }
+
+        match discord.release().await {
+            Ok(()) => info!("Released Discord presence: another instance owns it"),
+            Err(e) => warn!("Failed to release Discord presence: {}", e),
+        }
+        true
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         if !self.state.mark_shutting_down() {
             debug!("Presence service shutdown already in progress");
@@ -264,6 +340,8 @@ impl PresenceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::owner::dead_test_pid;
+    use crate::service::PresenceOwner;
 
     #[tokio::test]
     async fn test_shutdown_cancels_idle_timeout_and_marks_state() {
@@ -436,5 +514,116 @@ mod tests {
             1,
             "Only the timer armed by the latest update should fire"
         );
+    }
+
+    /// Logged once per release of this instance's presence.
+    const RELEASED: &str = "Released Discord presence";
+    /// PID assumed not to belong to any live process; used as "this instance".
+    const THIS_PID: u32 = u32::MAX - 11;
+
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// App state whose ownership record currently names this instance.
+    fn owned_state() -> Arc<AppState> {
+        let owner = PresenceOwner::with_pid(THIS_PID);
+        owner.set_record_owner(THIS_PID);
+        Arc::new(AppState {
+            owner: Arc::new(owner),
+            ..AppState::new()
+        })
+    }
+
+    /// Starts the watch and lets it record its first observation (as owner)
+    /// before the test changes the ownership record.
+    async fn start_watch(state: &Arc<AppState>) -> PresenceService {
+        let service = PresenceService::new(Arc::clone(state), PresenceConfig::default());
+        service.start_ownership_watch();
+        tokio::time::sleep(OWNERSHIP_CHECK_INTERVAL * 2).await;
+        service
+    }
+
+    #[test]
+    fn test_ownership_watch_reports_only_the_transition() {
+        let mut watch = OwnershipWatch::new(true);
+
+        assert!(!watch.lost_ownership(true));
+        assert!(watch.lost_ownership(false));
+        assert!(!watch.lost_ownership(false));
+        assert!(!watch.lost_ownership(true));
+        assert!(watch.lost_ownership(false));
+    }
+
+    #[test]
+    fn test_ownership_watch_detects_loss_again_after_reclaim_during_release() {
+        let mut watch = OwnershipWatch::new(true);
+        assert!(watch.lost_ownership(false));
+
+        // The release found that ownership had already come back.
+        watch.mark_owner();
+
+        assert!(watch.lost_ownership(false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ownership_watch_releases_once_when_another_instance_takes_over() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        let _service = start_watch(&state).await;
+
+        // The test process itself plays the other, live instance.
+        state.owner.set_record_owner(std::process::id());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            capture.count(RELEASED),
+            1,
+            "Release must happen once on the transition, not on every tick"
+        );
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ownership_watch_does_not_release_while_owner() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        let _service = start_watch(&state).await;
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(capture.count(RELEASED), 0);
+        state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ownership_watch_does_not_release_when_record_is_missing() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        let _service = start_watch(&state).await;
+
+        state.owner.remove_record();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(capture.count(RELEASED), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ownership_watch_does_not_release_when_owner_pid_is_dead() {
+        let (capture, _guard) = capture_logs();
+        let state = owned_state();
+        let _service = start_watch(&state).await;
+
+        state.owner.set_record_owner(dead_test_pid());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(capture.count(RELEASED), 0);
+        state.owner.remove_record();
     }
 }

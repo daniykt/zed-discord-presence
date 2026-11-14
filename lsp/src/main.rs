@@ -253,6 +253,7 @@ impl LanguageServer for Backend {
         }
 
         self.start_file_polling_loop();
+        self.presence_service.start_ownership_watch();
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
