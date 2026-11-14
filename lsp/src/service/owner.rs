@@ -179,6 +179,42 @@ fn process_alive(_pid: u32) -> bool {
     false
 }
 
+/// Test-only hooks so other modules can simulate other instances.
+#[cfg(test)]
+impl PresenceOwner {
+    /// An owner for `pid` with a fresh, never-written record path.
+    pub(crate) fn with_pid(pid: u32) -> Self {
+        Self::with_path(default_path(), pid)
+    }
+
+    /// Overwrites the record as if the instance with `pid` had claimed it.
+    pub(crate) fn set_record_owner(&self, pid: u32) {
+        fs::create_dir_all(self.path.parent().unwrap()).unwrap();
+        fs::write(&self.path, format!("{pid} 0\n")).unwrap();
+    }
+
+    /// Deletes the record and its test directory.
+    pub(crate) fn remove_record(&self) {
+        let _ = fs::remove_dir_all(self.path.parent().unwrap());
+    }
+}
+
+/// PID of a process that has already exited.
+#[cfg(test)]
+pub(crate) fn dead_test_pid() -> u32 {
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "exit 0"]);
+        command
+    } else {
+        std::process::Command::new("true")
+    };
+    let mut child = command.spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,21 +237,6 @@ mod tests {
 
     fn cleanup(owner: &PresenceOwner) {
         let _ = fs::remove_dir_all(owner.path.parent().unwrap());
-    }
-
-    /// PID of a process that has already exited.
-    fn dead_pid() -> u32 {
-        let mut command = if cfg!(windows) {
-            let mut command = std::process::Command::new("cmd");
-            command.args(["/C", "exit 0"]);
-            command
-        } else {
-            std::process::Command::new("true")
-        };
-        let mut child = command.spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
     }
 
     #[test]
@@ -243,7 +264,7 @@ mod tests {
     #[test]
     fn test_is_owner_when_recorded_process_is_dead() {
         let owner = test_owner(OTHER_PID);
-        write_raw(&owner, &format!("{} 0\n", dead_pid()));
+        write_raw(&owner, &format!("{} 0\n", dead_test_pid()));
 
         assert!(owner.is_owner());
         cleanup(&owner);
