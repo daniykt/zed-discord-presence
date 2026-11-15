@@ -21,6 +21,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -113,8 +114,10 @@ impl IdleManager {
                     }
                 }
                 IdleAction::ChangeActivity => {
-                    // The idle send reuses whatever start timestamp this
-                    // instance last set; it does not refresh it.
+                    // Same shared session start as the normal update path, so
+                    // the idle send never carries this process's own start.
+                    discord_guard
+                        .set_start_timestamp(Duration::from_millis(owner.session_start_ms()));
                     debug!(
                         "Idle action: sending the idle activity (pid {})",
                         std::process::id()
@@ -208,5 +211,34 @@ mod tests {
             .await;
 
         assert!(!idle_manager.has_timeout().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_send_uses_the_shared_session_start() {
+        let state = Arc::new(AppState::new());
+        state.config.lock().await.idle.timeout = Duration::from_secs(1);
+        // A start the idle send must replace with the shared session start.
+        state
+            .discord
+            .lock()
+            .await
+            .set_start_timestamp(Duration::from_millis(1));
+        let idle_manager =
+            IdleManager::new(Arc::clone(&state.shutting_down), Arc::clone(&state.owner));
+
+        idle_manager
+            .reset_timeout(
+                Arc::clone(&state.discord),
+                Arc::clone(&state.config),
+                Arc::clone(&state.git_remote_url),
+                Arc::clone(&state.git_branch),
+                Arc::clone(&state.last_document),
+                "workspace".to_string(),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let session = Duration::from_millis(state.owner.session_start_ms());
+        assert_eq!(state.discord.lock().await.start_timestamp(), session);
     }
 }

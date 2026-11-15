@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
@@ -168,7 +168,9 @@ fn lock_gate(gate: &StdMutex<SendGate>) -> StdMutexGuard<'_, SendGate> {
 #[derive(Debug)]
 pub struct Discord {
     client: Option<Arc<Mutex<DiscordIpcClient>>>,
-    start_timestamp: Duration,
+    /// Start of the elapsed timer (unix ms), shared with the deferred send
+    /// task so a pending send uses the value current at send time.
+    start_ms: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     send_gate: Arc<StdMutex<SendGate>>,
@@ -183,7 +185,7 @@ impl Discord {
 
         Self {
             client: None,
-            start_timestamp: since_epoch,
+            start_ms: Arc::new(AtomicU64::new(Self::to_millis(since_epoch))),
             connected: Arc::new(AtomicBool::new(false)),
             shutting_down,
             send_gate: Arc::default(),
@@ -201,7 +203,16 @@ impl Discord {
 
     /// Sets the start of the elapsed timer sent with every activity.
     pub fn set_start_timestamp(&mut self, start: Duration) {
-        self.start_timestamp = start;
+        self.start_ms
+            .store(Self::to_millis(start), Ordering::SeqCst);
+    }
+
+    fn current_start(start_ms: &AtomicU64) -> Duration {
+        Duration::from_millis(start_ms.load(Ordering::SeqCst))
+    }
+
+    fn to_millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Whether this connection shows an activity sent by this instance.
@@ -435,12 +446,11 @@ impl Discord {
         };
 
         let mut client = self.get_client().await?;
-        Self::send_activity(&mut client, &activity, self.start_timestamp, path).inspect_err(
-            |_| {
-                // Mark as disconnected so next attempt will reconnect
-                self.connected.store(false, Ordering::SeqCst);
-            },
-        )?;
+        let start_timestamp = Self::current_start(&self.start_ms);
+        Self::send_activity(&mut client, &activity, start_timestamp, path).inspect_err(|_| {
+            // Mark as disconnected so next attempt will reconnect
+            self.connected.store(false, Ordering::SeqCst);
+        })?;
         drop(client);
 
         lock_gate(&self.send_gate).record_sent(activity, Instant::now());
@@ -527,7 +537,7 @@ impl Discord {
         let client = self.client.clone();
         let connected = Arc::clone(&self.connected);
         let shutting_down = Arc::clone(&self.shutting_down);
-        let start_timestamp = self.start_timestamp;
+        let start_ms = Arc::clone(&self.start_ms);
 
         let task = tokio::spawn(async move {
             let mut flush_at = flush_at;
@@ -546,6 +556,15 @@ impl Discord {
                     lock_gate(&gate).end_flush();
                     return;
                 };
+
+                // Read at send time: the shared start may have changed while
+                // this send was pending.
+                let start_timestamp = Self::current_start(&start_ms);
+                debug!(
+                    "Deferred send: timestamps.start={} ms (pid {})",
+                    start_timestamp.as_millis(),
+                    std::process::id()
+                );
 
                 let mut client = client.lock().await;
                 if let Err(e) =
@@ -647,7 +666,7 @@ impl Discord {
 
     #[cfg(test)]
     pub(crate) fn start_timestamp(&self) -> Duration {
-        self.start_timestamp
+        Self::current_start(&self.start_ms)
     }
 }
 
@@ -721,7 +740,7 @@ mod tests {
     fn test_start_timestamp_is_set() {
         let discord = Discord::new(shutdown_signal(false));
         // Timestamp should be non-zero (set to current time)
-        assert!(discord.start_timestamp.as_millis() > 0);
+        assert!(discord.start_timestamp().as_millis() > 0);
     }
 
     #[tokio::test]
@@ -912,5 +931,57 @@ mod tests {
         assert!(error.to_string().contains("Timed out"));
         assert!(!discord.is_connected());
         drop(stuck_handshake);
+    }
+
+    /// In-memory sink for log output written on the current thread.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deferred_send_uses_the_start_current_at_send_time() {
+        let sink = LogSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut discord = Discord::new(shutdown_signal(false));
+        // An unconnected client: the deferred send reaches the write, which
+        // then fails without touching a real pipe.
+        discord.create_client("0").unwrap();
+        lock_gate(&discord.send_gate).record_sent(activity_with_state("first"), Instant::now());
+
+        discord.set_start_timestamp(Duration::from_millis(1_000));
+        let (fields, git_remote_url) = activity_with_state("second");
+        assert!(discord
+            .change_activity(fields, git_remote_url)
+            .await
+            .is_ok());
+
+        // The shared start changes while the send is still pending.
+        discord.set_start_timestamp(Duration::from_millis(2_000));
+        tokio::time::advance(MIN_SEND_INTERVAL).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let output = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            output.contains("Deferred send: timestamps.start=2000 ms"),
+            "{output}"
+        );
+        assert!(!output.contains("timestamps.start=1000"), "{output}");
     }
 }
