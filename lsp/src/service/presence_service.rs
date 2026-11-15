@@ -684,7 +684,7 @@ mod tests {
         let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
         let workspace_root = PathBuf::from("C:/test");
 
-        // Three updates spaced beyond the debounce window, so each one reaches
+        // Three updates spaced beyond the throttle window, so each one reaches
         // perform_update_internal and re-arms the idle timer.
         for i in 0..3 {
             let url = Url::from_file_path(workspace_root.join(format!("file{i}.rs"))).unwrap();
@@ -876,7 +876,7 @@ mod tests {
         let discord_busy = state.discord.lock().await;
 
         assert!(service.update_presence(Some(doc("first.rs"))).await.is_ok());
-        // Let the debounce expire so the update task blocks on the Discord lock.
+        // Let the first update start, so its send blocks on the Discord lock.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // A new editor event must not wait for that send to finish.
