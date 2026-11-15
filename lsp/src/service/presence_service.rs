@@ -40,8 +40,6 @@ const BACKGROUND_CONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// How often the owner re-asserts its presence. With the 20 s re-assert
 /// window, an unchanged activity is written at least every 30-35 s.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-/// Upper bound for how long continuous events can postpone a presence update.
-const UPDATE_MAX_WAIT: Duration = Duration::from_secs(2);
 /// How long a previous owner waits for the new owner's first send before
 /// clearing its own activity anyway.
 const RELEASE_FALLBACK: Duration = Duration::from_secs(3);
@@ -94,15 +92,22 @@ impl OwnershipWatch {
     }
 }
 
+/// Leading-edge throttle state for presence updates (see `schedule_update`).
+#[derive(Debug, Default)]
+struct Throttle {
+    /// When the last update was dispatched.
+    last_dispatch: Option<Instant>,
+    /// Send scheduled for the end of the current window, while it waits.
+    trailing: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[derive(Debug)]
 pub struct PresenceService {
     state: Arc<AppState>,
     idle_manager: Arc<IdleManager>,
-    debounce_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pending_doc: Arc<Mutex<Option<Document>>>,
-    update_debounce: Duration,
-    /// When the oldest event still waiting for the debounce arrived.
-    first_pending_at: Arc<StdMutex<Option<Instant>>>,
+    update_throttle: Duration,
+    throttle: Arc<StdMutex<Throttle>>,
 }
 
 impl PresenceService {
@@ -115,10 +120,9 @@ impl PresenceService {
         Self {
             state,
             idle_manager,
-            debounce_handle: Arc::new(Mutex::new(None)),
             pending_doc: Arc::new(Mutex::new(None)),
-            update_debounce: config.update_debounce,
-            first_pending_at: Arc::default(),
+            update_throttle: config.update_throttle,
+            throttle: Arc::default(),
         }
     }
 
@@ -126,83 +130,86 @@ impl PresenceService {
         self.schedule_update(doc, false).await
     }
 
-    /// Like `update_presence`, but without the debounce. Used for the first
-    /// event after this instance gains ownership, so the new owner sends at
-    /// once and the previous owner can clear its activity sooner.
+    /// Like `update_presence`, but ignores an open throttle window. Used for
+    /// the first event after this instance gains ownership, so the new owner
+    /// sends at once and the previous owner can clear its activity sooner.
     pub async fn update_presence_now(&self, doc: Option<Document>) -> Result<()> {
         self.schedule_update(doc, true).await
     }
 
+    /// Leading-edge throttle: if nothing was dispatched within the throttle
+    /// window (or `immediate` is set), the update is sent at once; otherwise
+    /// the latest pending update is sent when the window ends.
     async fn schedule_update(&self, doc: Option<Document>, immediate: bool) -> Result<()> {
-        // Store the document for deferred update
+        // The latest event always wins: the next send takes this document.
         *self.pending_doc.lock().await = doc;
 
-        // Cancel any pending debounce timer
-        if let Some(handle) = self.debounce_handle.lock().await.take() {
-            handle.abort();
+        let now = Instant::now();
+        let mut throttle = self.throttle.lock().unwrap_or_else(PoisonError::into_inner);
+        let since_last = throttle
+            .last_dispatch
+            .map(|last| now.saturating_duration_since(last));
+
+        match since_last {
+            Some(elapsed) if !immediate && elapsed < self.update_throttle => {
+                // Inside the window: one trailing send at its end picks up
+                // whatever is pending by then.
+                if throttle.trailing.is_none() {
+                    let delay = self.update_throttle.saturating_sub(elapsed);
+                    throttle.trailing = Some(self.spawn_send(Some(delay)));
+                }
+            }
+            _ => {
+                // Leading edge: send now. A waiting trailing send would only
+                // repeat this document.
+                if let Some(trailing) = throttle.trailing.take() {
+                    trailing.abort();
+                }
+                throttle.last_dispatch = Some(now);
+                drop(throttle);
+                self.spawn_send(None);
+            }
         }
 
-        let delay = if immediate {
-            Duration::ZERO
-        } else {
-            self.debounce_delay(Instant::now())
-        };
+        Ok(())
+    }
 
+    /// Spawns one send of the latest pending document: right away, or after
+    /// `trailing_delay` for the send at the end of a throttle window, which
+    /// then starts a new window.
+    fn spawn_send(&self, trailing_delay: Option<Duration>) -> tokio::task::JoinHandle<()> {
         let state = Arc::clone(&self.state);
         let pending_doc = Arc::clone(&self.pending_doc);
-        let debounce_handle = Arc::clone(&self.debounce_handle);
-        let first_pending_at = Arc::clone(&self.first_pending_at);
+        let throttle = Arc::clone(&self.throttle);
         let idle_manager = Arc::clone(&self.idle_manager);
 
-        // Spawn debounce task
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+        tokio::spawn(async move {
+            if let Some(delay) = trailing_delay {
+                tokio::time::sleep(delay).await;
+                let mut window = throttle.lock().unwrap_or_else(PoisonError::into_inner);
+                window.trailing = None;
+                window.last_dispatch = Some(Instant::now());
+            }
 
-            // Get the latest pending doc (might have changed during debounce).
             // Take it in its own statement: in edition 2021 a lock guard in an
             // `if let` scrutinee lives until the end of the block, which made
             // every update_presence call wait for the whole Discord send.
             let doc = pending_doc.lock().await.take();
-            *first_pending_at
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = None;
-            if let Some(doc) = doc {
-                let update_start = std::time::Instant::now();
-                if let Err(e) =
-                    Self::perform_update_internal(&state, &idle_manager, Some(doc)).await
-                {
-                    warn!("Failed to update Discord presence: {}", e);
-                } else {
-                    let total_elapsed = update_start.elapsed();
-                    info!(
-                        "Discord presence updated in {:.1}ms (debounce delay: {:.0}ms)",
-                        total_elapsed.as_secs_f64() * 1000.0,
-                        delay.as_secs_f64() * 1000.0
-                    );
-                }
+            let Some(doc) = doc else {
+                return;
+            };
+
+            let update_start = std::time::Instant::now();
+            if let Err(e) = Self::perform_update_internal(&state, &idle_manager, Some(doc)).await {
+                warn!("Failed to update Discord presence: {}", e);
+            } else {
+                info!(
+                    "Discord presence updated in {:.1}ms (throttle delay: {:.0}ms)",
+                    update_start.elapsed().as_secs_f64() * 1000.0,
+                    trailing_delay.unwrap_or_default().as_secs_f64() * 1000.0
+                );
             }
-
-            // Clear the handle
-            *debounce_handle.lock().await = None;
-        });
-
-        *self.debounce_handle.lock().await = Some(task);
-        Ok(())
-    }
-
-    /// Debounce delay for an event arriving at `now`: the regular debounce,
-    /// shortened so the update never waits more than `UPDATE_MAX_WAIT` after
-    /// the oldest event that is still pending.
-    fn debounce_delay(&self, now: Instant) -> Duration {
-        let mut first_pending_at = self
-            .first_pending_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let first = *first_pending_at.get_or_insert(now);
-        let waited = now.saturating_duration_since(first);
-
-        self.update_debounce
-            .min(UPDATE_MAX_WAIT.saturating_sub(waited))
+        })
     }
 
     async fn perform_update_internal(
@@ -562,8 +569,8 @@ mod tests {
         assert!(last_document.is_none());
     }
 
-    #[tokio::test]
-    async fn test_rapid_updates_batched_into_single_discord_call() {
+    #[tokio::test(start_paused = true)]
+    async fn test_rapid_updates_send_the_first_at_once_and_the_latest_at_window_end() {
         use std::path::PathBuf;
         use tower_lsp::lsp_types::Url;
 
@@ -579,12 +586,12 @@ mod tests {
             let url = Url::from_file_path(&file_path).unwrap();
             let doc = Document::new(&url, &workspace_root, None);
             assert!(service.update_presence(Some(doc)).await.is_ok());
-            // Small delay between calls, but less than debounce window (500ms)
+            // Small delay between calls, well inside the 2 s throttle window
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
-        // Wait for debounce to settle (500ms + buffer)
-        tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+        // Wait past the end of the throttle window
+        tokio::time::sleep(tokio::time::Duration::from_millis(2_500)).await;
 
         // Verify the final document stored in state (should be last one)
         let last_doc = state.last_document.lock().await;
@@ -596,8 +603,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_latest_document_sent_after_debounce() {
+    #[tokio::test(start_paused = true)]
+    async fn test_latest_document_sent_when_the_window_ends() {
         use std::path::PathBuf;
         use tower_lsp::lsp_types::Url;
 
@@ -613,15 +620,15 @@ mod tests {
         let doc1 = Document::new(&url1, &workspace_root, None);
         assert!(service.update_presence(Some(doc1.clone())).await.is_ok());
 
-        // Quickly send doc2 (before debounce expires)
+        // Quickly send doc2 (inside the throttle window)
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let file_path2 = workspace_root.join("file2.rs");
         let url2 = Url::from_file_path(&file_path2).unwrap();
         let doc2 = Document::new(&url2, &workspace_root, None);
         assert!(service.update_presence(Some(doc2.clone())).await.is_ok());
 
-        // Wait for debounce to settle
-        tokio::time::sleep(tokio::time::Duration::from_millis(700)).await;
+        // Wait past the end of the throttle window
+        tokio::time::sleep(tokio::time::Duration::from_millis(2_500)).await;
 
         // Verify the last document stored should be doc2
         let last_document = state.last_document.lock().await;
@@ -629,7 +636,7 @@ mod tests {
         let last_filename = last_document.as_ref().unwrap().get_filename().unwrap();
         assert_eq!(
             last_filename, "file2.rs",
-            "Latest document should be stored after debounce"
+            "Latest document should be sent when the window ends"
         );
     }
 
@@ -905,62 +912,119 @@ mod tests {
         state.owner.remove_record();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_first_update_after_gaining_ownership_skips_the_debounce() {
-        let debounced = Arc::new(AppState::new());
-        let immediate = Arc::new(AppState::new());
-        let debounced_service =
-            PresenceService::new(Arc::clone(&debounced), PresenceConfig::default());
-        let immediate_service =
-            PresenceService::new(Arc::clone(&immediate), PresenceConfig::default());
-
-        assert!(debounced_service
-            .update_presence(Some(test_doc("a.rs")))
+    /// File name of the document the last dispatched update carried.
+    async fn last_sent_file(state: &AppState) -> Option<String> {
+        state
+            .last_document
+            .lock()
             .await
-            .is_ok());
-        assert!(immediate_service
-            .update_presence_now(Some(test_doc("b.rs")))
+            .as_ref()
+            .and_then(|doc| doc.get_filename().ok())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_first_update_is_sent_immediately() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+
+        assert!(service
+            .update_presence(Some(test_doc("a.rs")))
             .await
             .is_ok());
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert!(
-            immediate.last_document.lock().await.is_some(),
-            "The immediate update must run without the debounce"
-        );
-        assert!(
-            debounced.last_document.lock().await.is_none(),
-            "A regular update still waits for the debounce"
-        );
+        assert_eq!(last_sent_file(&state).await.as_deref(), Some("a.rs"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_debounce_max_wait_caps_the_delay_under_continuous_events() {
+    async fn test_first_update_after_gaining_ownership_skips_the_throttle_window() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        assert!(service
+            .update_presence(Some(test_doc("a.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Inside the window, a regular update waits for the window end...
+        assert!(service
+            .update_presence(Some(test_doc("b.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(last_sent_file(&state).await.as_deref(), Some("a.rs"));
+
+        // ...but the first update after gaining ownership goes out at once.
+        assert!(service
+            .update_presence_now(Some(test_doc("c.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(last_sent_file(&state).await.as_deref(), Some("c.rs"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_burst_sends_at_most_one_update_per_window_with_the_latest_last() {
         let state = Arc::new(AppState::new());
         let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
         let start = Instant::now();
+        let mut sends: Vec<(Duration, String)> = Vec::new();
 
-        // An event every 300 ms keeps restarting the 500 ms debounce.
-        let mut updated_after = None;
-        for i in 0..20 {
-            assert!(service
-                .update_presence(Some(test_doc(&format!("file{i}.rs"))))
-                .await
-                .is_ok());
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        // An event every 100 ms for 5 s, then 3 s of quiet.
+        for i in 0..80 {
+            if i < 50 {
+                assert!(service
+                    .update_presence(Some(test_doc(&format!("file{i}.rs"))))
+                    .await
+                    .is_ok());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
-            if state.last_document.lock().await.is_some() {
-                updated_after = Some(start.elapsed());
-                break;
+            let sent = last_sent_file(&state).await;
+            if let Some(file) = sent {
+                if sends.last().map(|(_, last)| last) != Some(&file) {
+                    sends.push((start.elapsed(), file));
+                }
             }
         }
 
-        let updated_after =
-            updated_after.expect("Continuous events must not postpone the update forever");
-        assert!(
-            updated_after <= UPDATE_MAX_WAIT + Duration::from_millis(300),
-            "Update ran after {updated_after:?}"
+        assert_eq!(
+            sends.first().map(|(_, file)| file.as_str()),
+            Some("file0.rs")
         );
+        assert!(
+            sends[0].0 <= Duration::from_millis(100),
+            "The first one is immediate"
+        );
+        for pair in sends.windows(2) {
+            let gap = pair[1].0.saturating_sub(pair[0].0);
+            assert!(gap >= Duration::from_millis(1_900), "Sends {gap:?} apart");
+        }
+        assert_eq!(
+            sends.last().map(|(_, file)| file.as_str()),
+            Some("file49.rs"),
+            "The latest content goes out last"
+        );
+        assert!(sends.len() <= 4, "At most one send per 2 s: {sends:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_switch_after_a_quiet_window_is_sent_immediately() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        assert!(service
+            .update_presence(Some(test_doc("a.rs")))
+            .await
+            .is_ok());
+
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(service
+            .update_presence(Some(test_doc("b.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(last_sent_file(&state).await.as_deref(), Some("b.rs"));
     }
 
     #[tokio::test(start_paused = true)]

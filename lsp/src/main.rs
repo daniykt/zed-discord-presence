@@ -84,7 +84,7 @@ impl Backend {
         };
 
         let result = if acquired {
-            // First event after gaining ownership: skip the debounce so the
+            // First event after gaining ownership: skip the throttle window so the
             // previous owner can clear its activity sooner.
             self.presence_service.update_presence_now(Some(doc)).await
         } else {
