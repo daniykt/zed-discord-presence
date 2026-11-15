@@ -17,12 +17,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  */
 
-mod file_monitor;
 mod owner;
 mod presence_service;
 mod workspace_service;
 
-pub use file_monitor::FileMonitor;
 pub use owner::{recorded_session_ms, OwnershipCheck, PresenceOwner};
 pub use presence_service::PresenceService;
 pub use workspace_service::WorkspaceService;

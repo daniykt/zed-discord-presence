@@ -23,7 +23,7 @@ use crate::{
     document::Document,
     error::Result,
     idle::IdleManager,
-    service::{AppState, FileMonitor, OwnershipCheck},
+    service::{AppState, OwnershipCheck},
 };
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
@@ -95,7 +95,6 @@ impl OwnershipWatch {
 pub struct PresenceService {
     state: Arc<AppState>,
     idle_manager: Arc<IdleManager>,
-    file_monitor: FileMonitor,
     debounce_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pending_doc: Arc<Mutex<Option<Document>>>,
     update_debounce: Duration,
@@ -113,16 +112,11 @@ impl PresenceService {
         Self {
             state,
             idle_manager,
-            file_monitor: FileMonitor::new(),
             debounce_handle: Arc::new(Mutex::new(None)),
             pending_doc: Arc::new(Mutex::new(None)),
             update_debounce: config.update_debounce,
             first_pending_at: Arc::default(),
         }
-    }
-
-    pub fn file_monitor(&self) -> &FileMonitor {
-        &self.file_monitor
     }
 
     pub async fn update_presence(&self, doc: Option<Document>) -> Result<()> {
