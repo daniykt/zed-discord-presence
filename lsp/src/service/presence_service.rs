@@ -369,7 +369,9 @@ impl PresenceService {
                 return;
             }
 
-            info!("Discord is reachable; sending the latest presence");
+            // perform_update_internal skips the send unless this instance owns
+            // the presence, so a non-owner that reconnects stays silent.
+            info!("Discord is reachable; resending the latest presence if this instance owns it");
             if let Err(e) = Self::perform_update_internal(&state, &idle_manager, doc).await {
                 warn!("Failed to send the latest presence after connecting: {}", e);
             }
@@ -975,12 +977,13 @@ mod tests {
         assert!(!discord.is_connected());
     }
 
+    /// Logged right before every activity send attempt.
+    const SEND_ATTEMPT: &str = "Using shared session start";
+    /// Logged when the background connect succeeds and resends.
+    const RESEND_AFTER_CONNECT: &str = "Discord is reachable; resending the latest presence";
+
     #[tokio::test(start_paused = true)]
     async fn test_first_update_after_a_failed_connect_is_sent_once_discord_is_reachable() {
-        // Logged right before every activity send attempt.
-        const SEND_ATTEMPT: &str = "Using shared session start";
-        const REACHABLE: &str = "Discord is reachable; sending the latest presence";
-
         let (capture, _guard) = capture_logs();
         // No Discord client: every connect attempt fails, like a closed Discord.
         let state = Arc::new(AppState::new());
@@ -993,17 +996,47 @@ mod tests {
             .is_ok());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert_eq!(capture.count(SEND_ATTEMPT), 1, "The update itself failed");
-        assert_eq!(capture.count(REACHABLE), 0);
+        assert_eq!(capture.count(RESEND_AFTER_CONNECT), 0);
 
         // Discord becomes reachable.
         state.discord.lock().await.set_connected_for_test(true);
         tokio::time::sleep(BACKGROUND_CONNECT_MAX_DELAY).await;
 
-        assert_eq!(capture.count(REACHABLE), 1);
+        assert_eq!(capture.count(RESEND_AFTER_CONNECT), 1);
         assert_eq!(
             capture.count(SEND_ATTEMPT),
             2,
             "The latest presence is sent again once connected"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_non_owner_reconnects_and_does_not_send() {
+        let (capture, _guard) = capture_logs();
+        // This instance is THIS_PID; the live test process owns the presence.
+        let state = owned_state();
+        state.owner.set_record_owner(std::process::id());
+        assert!(!state.owner.is_owner());
+
+        // A document from an earlier update, waiting to be resent.
+        *state.last_document.lock().await = Some(test_doc("a.rs"));
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        service.start_background_connect();
+
+        // Discord becomes reachable.
+        state.discord.lock().await.set_connected_for_test(true);
+        tokio::time::sleep(BACKGROUND_CONNECT_MAX_DELAY).await;
+
+        assert_eq!(
+            capture.count(RESEND_AFTER_CONNECT),
+            1,
+            "The resend path ran"
+        );
+        assert_eq!(capture.count(SEND_ATTEMPT), 0, "A non-owner must not send");
+        assert!(
+            capture.count("Another instance owns the presence, skipping Discord activity update")
+                > 0
+        );
+        state.owner.remove_record();
     }
 }
