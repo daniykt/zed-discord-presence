@@ -33,6 +33,10 @@ use tracing::{debug, info, warn};
 
 /// How often each instance checks whether it still owns the presence.
 const OWNERSHIP_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// First wait between background connect attempts; doubles after each failure.
+const BACKGROUND_CONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+/// Longest wait between background connect attempts.
+const BACKGROUND_CONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// Upper bound for how long continuous events can postpone a presence update.
 const UPDATE_MAX_WAIT: Duration = Duration::from_secs(2);
 /// How long a previous owner waits for the new owner's first send before
@@ -327,10 +331,55 @@ impl PresenceService {
             return Ok(());
         }
 
+        // Only create the client: connecting is left to
+        // start_background_connect and to the first send, so initialize never
+        // waits for Discord.
         let mut discord = self.state.discord.lock().await;
         discord.create_client(application_id)?;
-        discord.connect_with_retry().await?;
         Ok(())
+    }
+
+    /// Connects to Discord in the background, retrying until it is reachable
+    /// (for example when Zed starts before Discord), then sends the latest
+    /// presence, if an update already happened.
+    pub fn start_background_connect(&self) {
+        let state = Arc::clone(&self.state);
+        let idle_manager = Arc::clone(&self.idle_manager);
+
+        tokio::spawn(async move {
+            let mut delay = BACKGROUND_CONNECT_INITIAL_DELAY;
+
+            loop {
+                if state.is_shutting_down() {
+                    return;
+                }
+
+                let connected = {
+                    let discord = state.discord.lock().await;
+                    discord.is_connected() || discord.connect().await.is_ok()
+                };
+                if connected {
+                    break;
+                }
+
+                debug!("Discord not reachable yet, retrying in {:?}", delay);
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(BACKGROUND_CONNECT_MAX_DELAY);
+            }
+
+            // Updates made while Discord was unreachable may have failed:
+            // send the latest one now. An already sent one is deduplicated.
+            let doc = state.last_document.lock().await.clone();
+            if doc.is_none() {
+                info!("Discord is reachable");
+                return;
+            }
+
+            info!("Discord is reachable; sending the latest presence");
+            if let Err(e) = Self::perform_update_internal(&state, &idle_manager, doc).await {
+                warn!("Failed to send the latest presence after connecting: {}", e);
+            }
+        });
     }
 
     /// Spawns the task that releases this instance's Discord connection when
@@ -912,5 +961,55 @@ mod tests {
         let session = Duration::from_millis(state.owner.session_start_ms());
         assert_eq!(state.discord.lock().await.start_timestamp(), session);
         state.owner.remove_record();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_initialize_discord_does_not_wait_for_discord() {
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        let started = Instant::now();
+
+        assert!(service.initialize_discord("0").await.is_ok());
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "No connect attempt or retry delay inside initialize"
+        );
+        let discord = state.discord.lock().await;
+        assert!(discord.has_client());
+        assert!(!discord.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_first_update_after_a_failed_connect_is_sent_once_discord_is_reachable() {
+        // Logged right before every activity send attempt.
+        const SEND_ATTEMPT: &str = "Using shared session start";
+        const REACHABLE: &str = "Discord is reachable; sending the latest presence";
+
+        let (capture, _guard) = capture_logs();
+        // No Discord client: every connect attempt fails, like a closed Discord.
+        let state = Arc::new(AppState::new());
+        let service = PresenceService::new(Arc::clone(&state), PresenceConfig::default());
+        service.start_background_connect();
+
+        assert!(service
+            .update_presence_now(Some(test_doc("a.rs")))
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(capture.count(SEND_ATTEMPT), 1, "The update itself failed");
+        assert_eq!(capture.count(REACHABLE), 0);
+
+        // Discord becomes reachable.
+        state.discord.lock().await.set_connected_for_test(true);
+        tokio::time::sleep(BACKGROUND_CONNECT_MAX_DELAY).await;
+
+        assert_eq!(capture.count(REACHABLE), 1);
+        assert_eq!(
+            capture.count(SEND_ATTEMPT),
+            2,
+            "The latest presence is sent again once connected"
+        );
     }
 }
