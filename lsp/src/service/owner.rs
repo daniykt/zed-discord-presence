@@ -246,14 +246,6 @@ impl Default for PresenceOwner {
     }
 }
 
-/// Session start stored in the ownership record, read without liveness
-/// checks or caching. For diagnostics only.
-#[must_use]
-pub fn recorded_session_ms() -> Option<u64> {
-    let text = fs::read_to_string(default_path()).ok()?;
-    OwnerRecord::parse(&text)?.session_ms
-}
-
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

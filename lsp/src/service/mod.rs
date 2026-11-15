@@ -21,7 +21,7 @@ mod owner;
 mod presence_service;
 mod workspace_service;
 
-pub use owner::{recorded_session_ms, OwnershipCheck, PresenceOwner};
+pub use owner::{OwnershipCheck, PresenceOwner};
 pub use presence_service::PresenceService;
 pub use workspace_service::WorkspaceService;
 

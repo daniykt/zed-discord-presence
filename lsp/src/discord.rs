@@ -408,7 +408,6 @@ impl Discord {
             crate::error::PresenceError::Discord(format!("Failed to clear activity: {e}"))
         })?;
 
-        debug!("SET_ACTIVITY clear written: pid={}", std::process::id());
         info!("Discord activity cleared");
         Ok(())
     }
@@ -523,17 +522,12 @@ impl Discord {
             crate::error::PresenceError::Discord(format!("Failed to set activity: {e}"))
         })?;
 
-        // Reading the record costs a file read, so only do it when logged.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                "SET_ACTIVITY written: path={} pid={} timestamps.start={} (unit: ms, {} s) recorded_session_ms={:?}",
-                path,
-                std::process::id(),
-                timestamp,
-                timestamp / 1000,
-                crate::service::recorded_session_ms()
-            );
-        }
+        debug!(
+            "Activity sent: path={} start_ms={} pid={}",
+            path,
+            timestamp,
+            std::process::id()
+        );
         Ok(())
     }
 
